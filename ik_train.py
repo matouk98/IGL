@@ -12,11 +12,11 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--max_train_samples", type=int, default=10000)
 parser.add_argument("--val_samples", type=int, default=2000)
-parser.add_argument("--batch_size", type=int, default=1)
+parser.add_argument("--batch_size", type=int, default=2)
 parser.add_argument("--gradient_acc", type=int, default=8)
-parser.add_argument("--learning_rate", type=float, default=1e-4)
+parser.add_argument("--learning_rate", type=float, default=1e-3)
 parser.add_argument("--num_epochs", type=int, default=10)
-parser.add_argument("--output_dir", type=str, default="ik-lr4")
+parser.add_argument("--output_dir", type=str, default="ik-lr3")
 args = parser.parse_args()
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -66,7 +66,6 @@ peft_config = LoraConfig(
 )
 model = get_peft_model(base_model, peft_config)
 model.config.pad_token_id = tokenizer.pad_token_id
-model.cuda()
 model.train()
 
 # === Collate function ===
@@ -90,17 +89,23 @@ val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
 # === Optimizer ===
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
+from accelerate import Accelerator
+accelerator = Accelerator()
+
+model, optimizer, train_loader, val_loader = accelerator.prepare(
+    model, optimizer, train_loader, val_loader
+)
 # === Training ===
-print("Starting training...")
+accelerator.print("Starting training...")
 for epoch in range(args.num_epochs):
     model.train()
     total_loss = 0
     correct = 0
 
     for step, batch in enumerate(tqdm(train_loader)):
-        input_ids = batch["input_ids"].cuda()
-        attention_mask = batch["attention_mask"].cuda()
-        labels = batch["labels"].cuda()
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
 
         logits_list = []
         for i in range(5):
@@ -109,7 +114,8 @@ for epoch in range(args.num_epochs):
         logits_stacked = torch.stack(logits_list, dim=1)
 
         loss = F.cross_entropy(logits_stacked, labels) / args.gradient_acc
-        loss.backward()
+        # loss.backward()
+        accelerator.backward(loss)
 
         if (step + 1) % args.gradient_acc == 0 or (step + 1 == len(train_loader)):
             optimizer.step()
@@ -131,10 +137,10 @@ for epoch in range(args.num_epochs):
 
     with torch.no_grad():
         for batch in val_loader:
-            input_ids = batch["input_ids"].cuda()
-            attention_mask = batch["attention_mask"].cuda()
-            labels = batch["labels"].cuda()
-            original = batch["original_label"].cuda()
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
+            original = batch["original_label"]
 
             logits_list = []
             for i in range(5):
@@ -153,11 +159,12 @@ for epoch in range(args.num_epochs):
 
     val_acc_4 = val_correct_4 / val_total_4 if val_total_4 else 0
     val_acc_others = val_correct_others / val_total_others if val_total_others else 0
-    print(f"Epoch {epoch + 1} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+    accelerator.print(f"Epoch {epoch + 1} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
           f"Pos Acc: {val_acc_4:.4f}, Neg Acc: {val_acc_others:.4f}")
 
     # Save checkpoint
-    save_dir = os.path.join(args.output_dir, f"epoch-{epoch + 1}")
-    os.makedirs(save_dir, exist_ok=True)
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
+    if accelerator.is_main_process:
+        save_dir = os.path.join(args.output_dir, f"epoch-{epoch + 1}")
+        os.makedirs(save_dir, exist_ok=True)
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
