@@ -4,10 +4,11 @@ import torch
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model, PeftConfig
 from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model, PeftConfig
 import argparse
+import random
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", type=int, default=1)
@@ -47,52 +48,36 @@ model.eval()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
-
-
-# ik_config = LoraConfig(
-#     task_type=TaskType.SEQ_CLS,
-#     r=8,
-#     lora_alpha=16,
-#     lora_dropout=0.1,
-#     bias="none",
-#     target_modules=["q_proj", "v_proj"]
-# )
-
-# model = get_peft_model(base_model, ik_config, adapter_name="dm")
-# # Load the saved "ik" adapter
-# adapter_name = 'ik'
-# model.load_adapter(adapter_path, adapter_name=adapter_name, is_trainable=False)
-# print(f"✅ Adapter '{adapter_name}' loaded from: {adapter_path}")
-
-# # Activate the "ik" adapter
-# model.active_adapter = adapter_name
-
-# === load feedback model ===
+# === 初始化 LLM（用于生成反馈）===
 llm = LLM(model=llm_gen_path, max_model_len=2048)
 sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=128)
 
-# === generate feedback prompts ===
+# === 构造反馈 prompt（对0-3模型的随机回答）===
 feedback_prompts = []
 questions = []
+answer_sources = []
 
 for i in range(num_samples):
-    question = raw_data[4][i]["original_prompt"]
-    answer = raw_data[4][i]["answer"]
+    question = raw_data[0][i]["original_prompt"]
+    chosen_model = random.choice([0, 1, 2, 3])
+    answer = raw_data[chosen_model][i]["answer"]
     prompt = (
         f"You are a user simulator. A user has been presented a Question and an Answer. "
         f"Question: {question}\n"
         f"Answer: {answer}\n"
-        f"Simulate the user’s feedback. The user is satisfied with the Answer to the Question.\n\n"
+        f"Simulate the user’s feedback. The user is unsatisfied with the Answer to the Question.\n\n"
     )
     feedback_prompts.append(prompt)
     questions.append(question)
+    answer_sources.append(chosen_model)
 
+# === 生成反馈 ===
 print("🔄 Generating feedback...")
 feedback_outputs = llm.generate(feedback_prompts, sampling_params)
 feedback_texts = [out.outputs[0].text.strip() for out in feedback_outputs]
 
-# === generate test samples ===
-all_logits = [[] for _ in range(num_samples)]  # save five logits
+# === 构造测试样本（每个问题生成5条：对应0-4的answer）===
+all_logits = [[] for _ in range(num_samples)]
 
 def tokenize_batch(prompts):
     inputs = tokenizer(prompts, padding=True, return_tensors="pt", truncation=True)
@@ -119,6 +104,7 @@ for model_idx in range(5):
         )
         prompts.append(prompt)
 
+    # 批量推理
     batch_logits = []
     for i in tqdm(range(0, len(prompts), args.batch_size)):
         batch_prompts = prompts[i:i + args.batch_size]
@@ -127,18 +113,24 @@ for model_idx in range(5):
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
             batch_logits.extend(logits.cpu().tolist())
 
+    # 保存当前模型的logits
     for i in range(num_samples):
         all_logits[i].append(batch_logits[i])
 
-probs_14B = [torch.softmax(torch.tensor(logits), dim=-1)[4].item() for logits in all_logits]
-avg_prob = sum(probs_14B) / len(probs_14B)
-print(f"\n🔍 Avg softmax probability for 14B answers: {avg_prob:.4f}")
+# === 每个样本对5个logit做softmax，提取被选中模型的概率 ===
+probs_selected = [
+    torch.softmax(torch.tensor(logits), dim=-1)[answer_sources[i]].item()
+    for i, logits in enumerate(all_logits)
+]
+avg_prob = sum(probs_selected) / len(probs_selected)
+print(f"\n🔍 Avg softmax probability for randomly selected 0.5B answers: {avg_prob:.4f}")
 
-os.makedirs('./pos_figs', exist_ok=True)
-plt.hist(probs_14B, bins=50, alpha=0.75)
-plt.title("Softmax Probability for 14B Answers (Binary Model)")
+# === 可视化 ===
+os.makedirs('./neg_figs', exist_ok=True)
+plt.hist(probs_selected, bins=50, alpha=0.75)
+plt.title("Softmax Probability for Random 0.5B Answers (Binary Model)")
 plt.xlabel("Probability")
 plt.ylabel("Frequency")
 plt.grid(True)
-plt.savefig(f"./pos_figs/predicted_prob_softmax_14B_{model_name}_{iter_num}.png")
-print(f"📊 Saved histogram to predicted_prob_softmax_14B_{model_name}_{iter_num}.png")
+plt.savefig(f"./neg_figs/predicted_prob_softmax_0.5B_{model_name}_{iter_num}.png")
+print(f"📊 Saved histogram to predicted_prob_softmax_0.5B_{model_name}_{iter_num}.png")
