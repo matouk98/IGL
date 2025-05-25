@@ -4,11 +4,11 @@ from transformers import AutoTokenizer
 import json
 import re
 
-model_name = "Qwen/Qwen2.5-14B-Instruct"
-ds = load_dataset("RLHFlow/prompt-collection-v0.1", split="train")
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+ds = load_dataset("lmsys/chatbot_arena_conversations", split="train")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-def truncate_prompt(text, max_tokens=512):
+def truncate_prompt(text, max_tokens=128):
     tokens = tokenizer.encode(text, add_special_tokens=False)
     if len(tokens) <= max_tokens:
         return text
@@ -17,10 +17,10 @@ def truncate_prompt(text, max_tokens=512):
         return tokenizer.decode(truncated_tokens, skip_special_tokens=True)
 
 cnt = 0
-max_tokens = 512
+max_tokens = 128
 prompts = []
 for sample in ds:
-    text = sample['context_messages'][0]['content']
+    text = sample['conversation_a'][0]['content']
     tokens = tokenizer.encode(text, add_special_tokens=False)
     if len(tokens) <= max_tokens:
         cnt += 1
@@ -28,21 +28,21 @@ for sample in ds:
     if cnt == 20000:
         break
 
-output_file = "{}_question_answer.json".format(model_name.split('/')[-1])
+output_file = "{}_question_answer_4.json".format(model_name.split('/')[-1])
 llm = LLM(model=model_name, max_model_len=2048)
 
 sampling_params_clarification = SamplingParams(
     temperature=0.7,
     top_p=0.9,
-    max_tokens=256,
-    seed=1
+    max_tokens=128,
+    seed=4
 )
 
 sampling_params_answer = SamplingParams(
     temperature=0.7,
     top_p=0.9,
-    max_tokens=256,
-    seed=1
+    max_tokens=128,
+    seed=4
 )
 
 def make_clarification_prompt(original_prompt):
